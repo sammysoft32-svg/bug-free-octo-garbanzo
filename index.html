@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+  <title>POS SaaS - Multi-tenant Point of Sale</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <!-- Axios -->
+  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+  <!-- React & ReactDOM -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.development.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.development.js"></script>
+  <!-- Babel for JSX -->
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
+  <!-- Clerk SDK -->
+  <script src="https://cdn.jsdelivr.net/npm/@clerk/clerk-js@4/dist/clerk.browser.js"></script>
+  <!-- Stripe JS -->
+  <script src="https://js.stripe.com/v3/"></script>
+  <!-- Paystack (inline) -->
+  <script src="https://js.paystack.co/v1/inline.js"></script>
+  <!-- Lucide Icons (optional) -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <style>
+    /* custom scrollbar for dark theme */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: #1f2937; }
+    ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+    body { font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+    .transition-all { transition-property: all; transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1); transition-duration: 150ms; }
+  </style>
+</head>
+<body class="bg-gray-900 text-white">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback } = React;
+
+    // ---------- API Client ----------
+    const apiClient = axios.create({ baseURL: 'http://localhost:5000/api' });
+    apiClient.interceptors.request.use(async (config) => {
+      const token = await window.Clerk?.session?.getToken();
+      if (token) config.headers.Authorization = `Bearer ${token}`;
+      const businessId = localStorage.getItem('selectedBusinessId');
+      if (businessId) config.headers['X-Business-ID'] = businessId;
+      return config;
+    });
+
+    // ---------- Helper: toast ----------
+    const showToast = (message, type = 'success') => {
+      const toastDiv = document.createElement('div');
+      toastDiv.className = `fixed bottom-4 right-4 z-50 px-4 py-2 rounded-lg shadow-lg text-sm font-medium ${
+        type === 'error' ? 'bg-red-600' : 'bg-green-600'
+      } text-white`;
+      toastDiv.innerText = message;
+      document.body.appendChild(toastDiv);
+      setTimeout(() => toastDiv.remove(), 3000);
+    };
+
+    // ---------- Main App ----------
+    const App = () => {
+      const [isLoaded, setIsLoaded] = useState(false);
+      const [isSignedIn, setIsSignedIn] = useState(false);
+      const [user, setUser] = useState(null);
+      const [businesses, setBusinesses] = useState([]);
+      const [selectedBusinessId, setSelectedBusinessId] = useState(localStorage.getItem('selectedBusinessId') || '');
+      const [activeTab, setActiveTab] = useState('pos'); // pos, inventory, dashboard, billing
+      
+      // POS state
+      const [products, setProducts] = useState([]);
+      const [cart, setCart] = useState([]);
+      const [searchTerm, setSearchTerm] = useState('');
+      const [paymentMethod, setPaymentMethod] = useState('stripe'); // stripe, paystack
+      const [processing, setProcessing] = useState(false);
+
+      // Inventory modal
+      const [showProductModal, setShowProductModal] = useState(false);
+      const [editingProduct, setEditingProduct] = useState(null);
+      const [productForm, setProductForm] = useState({ name: '', price: '', stock: '', sku: '', barcode: '', category: '' });
+
+      // Dashboard
+      const [salesData, setSalesData] = useState({ labels: [], values: [] });
+      let revenueChart = null;
+
+      // Billing
+      const [currentSubscription, setCurrentSubscription] = useState(null);
+      const [plans, setPlans] = useState([]);
+      const [invoices, setInvoices] = useState([]);
+
+      // Initialize Clerk
+      useEffect(() => {
+        const clerkPubKey = 'pk_test_YOUR_CLERK_PUBLISHABLE_KEY'; // Replace with your Clerk key
+        if (!window.Clerk) return;
+        window.Clerk.load({ publishableKey: clerkPubKey }).then(() => {
+          setIsLoaded(true);
+          setIsSignedIn(window.Clerk.user ? true : false);
+          setUser(window.Clerk.user);
+          window.Clerk.addListener(({ user }) => {
+            setIsSignedIn(!!user);
+            setUser(user);
+            if (user) fetchUserBusinesses();
+          });
+        });
+      }, []);
+
+      // Fetch businesses for current user
+      const fetchUserBusinesses = async () => {
+        try {
+          const res = await apiClient.get('/business/user-businesses');
+          setBusinesses(res.data);
+          if (!selectedBusinessId && res.data.length) {
+            const firstId = res.data[0].id;
+            setSelectedBusinessId(firstId);
+            localStorage.setItem('selectedBusinessId', firstId);
+          }
+        } catch (err) {
+          console.error(err);
+          showToast('Failed to load businesses', 'error');
+        }
+      };
+
+      // Switch business
+      useEffect(() => {
+        if (selectedBusinessId) {
+          localStorage.setItem('selectedBusinessId', selectedBusinessId);
+          if (activeTab === 'pos' || activeTab === 'inventory') fetchProducts();
+          if (activeTab === 'dashboard') fetchDashboard();
+          if (activeTab === 'billing') fetchBillingData();
+        }
+      }, [selectedBusinessId, activeTab]);
+
+      const fetchProducts = async () => {
+        try {
+          const res = await apiClient.get('/products');
+          setProducts(res.data.products);
+        } catch (err) {
+          showToast('Error loading products', 'error');
+        }
+      };
+
+      const fetchDashboard = async () => {
+        try {
+          const res = await apiClient.get('/dashboard/sales-analytics');
+          setSalesData({ labels: res.data.labels, values: res.data.values });
+          if (revenueChart) revenueChart.destroy();
+          const ctx = document.getElementById('revenueChart')?.getContext('2d');
+          if (ctx) {
+            revenueChart = new Chart(ctx, {
+              type: 'line',
+              data: { labels: res.data.labels, datasets: [{ label: 'Revenue ($)', data: res.data.values, borderColor: '#3b82f6', tension: 0.3 }] },
+              options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#fff' } } }, scales: { y: { ticks: { color: '#fff' } }, x: { ticks: { color: '#fff' } } } }
+            });
+          }
+        } catch (err) { console.error(err); }
+      };
+
+      const fetchBillingData = async () => {
+        try {
+          const [subRes, plansRes, invRes] = await Promise.all([
+            apiClient.get('/subscription/current'),
+            apiClient.get('/subscription/plans'),
+            apiClient.get('/subscription/invoices')
+          ]);
+          setCurrentSubscription(subRes.data);
+          setPlans(plansRes.data);
+          setInvoices(invRes.data);
+        } catch (err) { console.error(err); }
+      };
+
+      // Cart actions
+      const addToCart = (product) => {
+        setCart(prev => {
+          const exists = prev.find(i => i.id === product.id);
+          if (exists) return prev.map(i => i.id === product.id ? { ...i, quantity: i.quantity + 1 } : i);
+          return [...prev, { ...product, quantity: 1 }];
+        });
+        showToast(`${product.name} added to cart`);
+      };
+      const updateCartQty = (id, delta) => {
+        setCart(prev => prev.map(i => i.id === id ? { ...i, quantity: Math.max(0, i.quantity + delta) } : i).filter(i => i.quantity > 0));
+      };
+      const removeCartItem = (id) => setCart(prev => prev.filter(i => i.id !== id));
+      const cartTotal = cart.reduce((sum, i) => sum + i.price * i.quantity, 0);
+
+      // Checkout: create payment intent & confirm
+      const handleCheckout = async () => {
+        if (cart.length === 0) { showToast('Cart is empty', 'error'); return; }
+        setProcessing(true);
+        try {
+          const { data } = await apiClient.post('/transactions/create-payment-intent', {
+            amount: cartTotal,
+            paymentMethod,
+            currency: 'usd'
+          });
+          if (paymentMethod === 'stripe') {
+            const stripe = Stripe('pk_test_YOUR_STRIPE_PUBLISHABLE_KEY'); // Replace
+            const result = await stripe.confirmCardPayment(data.clientSecret);
+            if (result.error) throw new Error(result.error.message);
+            await apiClient.post('/transactions', {
+              items: cart.map(i => ({ productId: i.id, quantity: i.quantity, unitPrice: i.price })),
+              totalAmount: cartTotal,
+              paymentMethod: 'stripe',
+              paymentIntentId: result.paymentIntent.id
+            });
+            showToast('Payment successful!');
+            setCart([]);
+            fetchProducts();
+          } else if (paymentMethod === 'paystack') {
+            // redirect to Paystack popup (simplified)
+            const paystackHandler = PaystackPop.setup({
+              key: 'pk_test_YOUR_PAYSTACK_PUBLIC_KEY', // Replace
+              email: user?.primaryEmailAddress?.emailAddress || 'customer@example.com',
+              amount: cartTotal * 100,
+              currency: 'USD',
+              ref: data.reference,
+              callback: async (response) => {
+                await apiClient.post('/transactions', {
+                  items: cart.map(i => ({ productId: i.id, quantity: i.quantity, unitPrice: i.price })),
+                  totalAmount: cartTotal,
+                  paymentMethod: 'paystack',
+                  paystackReference: response.reference
+                });
+                showToast('Payment successful!');
+                setCart([]);
+                fetchProducts();
+              },
+              onClose: () => showToast('Payment cancelled', 'error')
+            });
+            paystackHandler.openIframe();
+          }
+        } catch (err) {
+          showToast(err.message, 'error');
+        } finally { setProcessing(false); }
+      };
+
+      // Inventory CRUD
+      const saveProduct = async () => {
+        try {
+          if (editingProduct) {
+            await apiClient.put(`/products/${editingProduct.id}`, productForm);
+            showToast('Product updated');
+          } else {
+            await apiClient.post('/products', productForm);
+            showToast('Product created');
+          }
+          setShowProductModal(false);
+          setEditingProduct(null);
+          setProductForm({ name: '', price: '', stock: '', sku: '', barcode: '', category: '' });
+          fetchProducts();
+        } catch (err) { showToast(err.response?.data?.error || 'Error saving product', 'error'); }
+      };
+      const deleteProduct = async (id) => {
+        if (confirm('Delete product?')) {
+          await apiClient.delete(`/products/${id}`);
+          fetchProducts();
+          showToast('Deleted');
+        }
+      };
+
+      // Billing actions
+      const handleSubscribe = async (priceId, planId) => {
+        try {
+          const res = await apiClient.post('/subscription/create-checkout', { priceId, planId });
+          window.location.href = res.data.url;
+        } catch (err) { showToast('Error starting checkout', 'error'); }
+      };
+      const handleCancelSub = async () => {
+        if (confirm('Cancel subscription? You will lose access at end of period.')) {
+          await apiClient.post('/subscription/cancel');
+          showToast('Subscription cancelled');
+          fetchBillingData();
+        }
+      };
+      const handleReactivate = async () => {
+        await apiClient.post('/subscription/reactivate');
+        showToast('Subscription reactivated');
+        fetchBillingData();
+      };
+      const handleManagePortal = async () => {
+        const res = await apiClient.post('/subscription/portal');
+        window.location.href = res.data.url;
+      };
+
+      if (!isLoaded) return <div className="flex justify-center items-center h-screen">Loading...</div>;
+      if (!isSignedIn) return (
+        <div className="flex flex-col items-center justify-center h-screen bg-gray-900">
+          <button onClick={() => window.Clerk.openSignIn()} className="bg-blue-600 px-6 py-3 rounded-lg text-lg">Sign In / Sign Up</button>
+          <p className="mt-4 text-gray-400">Multi-tenant POS with subscriptions</p>
+        </div>
+      );
+
+      return (
+        <div className="min-h-screen flex flex-col">
+          {/* Header */}
+          <header className="bg-gray-800 border-b border-gray-700 px-6 py-3 flex justify-between items-center flex-wrap gap-3">
+            <div className="text-2xl font-bold text-blue-400">POS SaaS</div>
+            <div className="flex items-center gap-4">
+              {businesses.length > 0 && (
+                <select value={selectedBusinessId} onChange={e => setSelectedBusinessId(e.target.value)} className="bg-gray-700 rounded px-3 py-1 text-sm">
+                  {businesses.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+                </select>
+              )}
+              <button onClick={() => window.Clerk.signOut()} className="text-sm text-gray-300 hover:text-white">Sign Out</button>
+              <div className="w-8 h-8 rounded-full bg-blue-500 flex items-center justify-center text-sm font-bold">{user?.firstName?.[0]}</div>
+            </div>
+          </header>
+
+          {/* Tabs */}
+          <div className="flex gap-2 px-6 pt-4 border-b border-gray-800">
+            {['pos', 'inventory', 'dashboard', 'billing'].map(tab => (
+              <button key={tab} onClick={() => setActiveTab(tab)} className={`px-4 py-2 rounded-t-lg capitalize ${activeTab === tab ? 'bg-gray-800 text-white' : 'text-gray-400 hover:text-white'}`}>
+                {tab}
+              </button>
+            ))}
+          </div>
+
+          {/* Main content */}
+          <div className="flex-1 p-6">
+            {/* POS Tab */}
+            {activeTab === 'pos' && (
+              <div className="flex flex-col lg:flex-row gap-6">
+                {/* Products grid */}
+                <div className="flex-1">
+                  <input type="text" placeholder="Search or scan barcode..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} className="w-full mb-4 px-4 py-2 bg-gray-800 rounded-lg" />
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4 max-h-[70vh] overflow-auto">
+                    {products.filter(p => p.name.toLowerCase().includes(searchTerm.toLowerCase())).map(p => (
+                      <div key={p.id} onClick={() => addToCart(p)} className="bg-gray-800 rounded-lg p-3 cursor-pointer hover:bg-gray-700 transition">
+                        <div className="aspect-square bg-gray-700 rounded mb-2 flex items-center justify-center text-4xl">🛍️</div>
+                        <h3 className="font-semibold text-sm truncate">{p.name}</h3>
+                        <p className="text-blue-400 font-bold">${p.price}</p>
+                        <p className="text-xs text-gray-400">Stock: {p.stock}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                {/* Cart sidebar */}
+                <div className="lg:w-96 bg-gray-800 rounded-lg flex flex-col h-[80vh]">
+                  <div className="p-4 border-b border-gray-700 font-bold text-lg">Cart ({cart.length})</div>
+                  <div className="flex-1 overflow-auto p-4 space-y-3">
+                    {cart.map(item => (
+                      <div key={item.id} className="bg-gray-700 p-3 rounded">
+                        <div className="flex justify-between"><span className="font-semibold">{item.name}</span><button onClick={() => removeCartItem(item.id)} className="text-red-400">✕</button></div>
+                        <div className="flex justify-between items-center mt-2">
+                          <div className="flex gap-2 items-center"><button onClick={() => updateCartQty(item.id, -1)} className="bg-gray-600 px-2 py-1 rounded">-</button><span>{item.quantity}</span><button onClick={() => updateCartQty(item.id, 1)} className="bg-gray-600 px-2 py-1 rounded">+</button></div>
+                          <span className="font-bold">${(item.price * item.quantity).toFixed(2)}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="p-4 border-t border-gray-700">
+                    <div className="flex gap-2 mb-3">
+                      <button onClick={() => setPaymentMethod('stripe')} className={`flex-1 py-2 rounded ${paymentMethod === 'stripe' ? 'bg-blue-600' : 'bg-gray-700'}`}>Stripe</button>
+                      <button onClick={() => setPaymentMethod('paystack')} className={`flex-1 py-2 rounded ${paymentMethod === 'paystack' ? 'bg-blue-600' : 'bg-gray-700'}`}>Paystack</button>
+                    </div>
+                    <div className="text-2xl font-bold mb-3">Total: ${cartTotal.toFixed(2)}</div>
+                    <button onClick={handleCheckout} disabled={processing || cart.length===0} className="w-full bg-blue-600 py-3 rounded-lg font-semibold disabled:opacity-50">Checkout</button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Inventory Tab */}
+            {activeTab === 'inventory' && (
+              <div>
+                <button onClick={() => { setEditingProduct(null); setProductForm({ name: '', price: '', stock: '', sku: '', barcode: '', category: '' }); setShowProductModal(true); }} className="mb-4 bg-blue-600 px-4 py-2 rounded-lg">+ Add Product</button>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left">
+                    <thead className="bg-gray-800"><tr><th className="p-3">Name</th><th>Price</th><th>Stock</th><th>SKU</th><th>Actions</th></tr></thead>
+                    <tbody>
+                      {products.map(p => (
+                        <tr key={p.id} className="border-b border-gray-700"><td className="p-3">{p.name}</td><td>${p.price}</td><td>{p.stock}</td><td>{p.sku || '-'}</td><td><button onClick={() => { setEditingProduct(p); setProductForm(p); setShowProductModal(true); }} className="text-blue-400 mr-2">Edit</button><button onClick={() => deleteProduct(p.id)} className="text-red-400">Delete</button></td></tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* Dashboard Tab */}
+            {activeTab === 'dashboard' && (
+              <div>
+                <div className="bg-gray-800 p-4 rounded-lg mb-6">
+                  <h2 className="text-xl font-bold mb-4">Revenue (last 7 days)</h2>
+                  <canvas id="revenueChart" height="200"></canvas>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div className="bg-gray-800 p-4 rounded"><p className="text-gray-400">Total Sales</p><p className="text-2xl font-bold">${salesData.values.reduce((a,b)=>a+b,0).toFixed(2)}</p></div>
+                  <div className="bg-gray-800 p-4 rounded"><p className="text-gray-400">Transactions</p><p className="text-2xl font-bold">--</p></div>
+                  <div className="bg-gray-800 p-4 rounded"><p className="text-gray-400">Low Stock Items</p><p className="text-2xl font-bold">{products.filter(p=>p.stock<5).length}</p></div>
+                </div>
+              </div>
+            )}
+
+            {/* Billing Tab */}
+            {activeTab === 'billing' && (
+              <div className="max-w-3xl">
+                <div className="bg-gray-800 rounded-lg p-6 mb-6">
+                  <h2 className="text-xl font-bold mb-2">Current Plan</h2>
+                  <p className="text-3xl text-blue-400 capitalize">{currentSubscription?.plan || 'No active plan'}</p>
+                  <p className="text-gray-300">Status: {currentSubscription?.status}</p>
+                  {currentSubscription?.details && (
+                    <div className="mt-3 text-sm">Next billing: {new Date(currentSubscription.details.currentPeriodEnd).toLocaleDateString()}</div>
+                  )}
+                  <div className="mt-4 flex gap-3">
+                    {currentSubscription?.status === 'active' && !currentSubscription.details?.cancelAtPeriodEnd && <button onClick={handleCancelSub} className="bg-red-600 px-4 py-2 rounded">Cancel</button>}
+                    {currentSubscription?.details?.cancelAtPeriodEnd && <button onClick={handleReactivate} className="bg-blue-600 px-4 py-2 rounded">Reactivate</button>}
+                    <button onClick={handleManagePortal} className="bg-gray-700 px-4 py-2 rounded">Manage Portal</button>
+                  </div>
+                </div>
+                <div className="mb-6"><h3 className="text-lg font-semibold mb-3">Upgrade</h3><div className="grid md:grid-cols-3 gap-4">{plans.map(plan => (<div key={plan.id} className="bg-gray-800 p-4 rounded"><h4 className="font-bold">{plan.name}</h4><p className="text-2xl">${plan.amount}/mo</p><button onClick={() => handleSubscribe(plan.stripePriceId, plan.id)} className="mt-2 bg-blue-600 px-3 py-1 rounded text-sm">Switch</button></div>))}</div></div>
+                <div><h3 className="text-lg font-semibold mb-3">Invoices</h3>{invoices.length===0 ? <p className="text-gray-400">No invoices</p> : invoices.map(inv => (<div key={inv.id} className="bg-gray-800 p-3 rounded mb-2 flex justify-between"><span>{new Date(inv.created).toLocaleDateString()}</span><span>${inv.amount} {inv.currency}</span><a href={inv.pdfUrl} target="_blank" className="text-blue-400">PDF</a></div>))}</div>
+              </div>
+            )}
+          </div>
+
+          {/* Product Modal */}
+          {showProductModal && (
+            <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+              <div className="bg-gray-800 p-6 rounded-lg w-full max-w-md">
+                <h3 className="text-xl mb-4">{editingProduct ? 'Edit Product' : 'New Product'}</h3>
+                <input className="w-full mb-3 p-2 bg-gray-700 rounded" placeholder="Name" value={productForm.name} onChange={e => setProductForm({...productForm, name: e.target.value})} />
+                <input className="w-full mb-3 p-2 bg-gray-700 rounded" placeholder="Price" type="number" value={productForm.price} onChange={e => setProductForm({...productForm, price: e.target.value})} />
+                <input className="w-full mb-3 p-2 bg-gray-700 rounded" placeholder="Stock" type="number" value={productForm.stock} onChange={e => setProductForm({...productForm, stock: e.target.value})} />
+                <input className="w-full mb-3 p-2 bg-gray-700 rounded" placeholder="SKU" value={productForm.sku} onChange={e => setProductForm({...productForm, sku: e.target.value})} />
+                <input className="w-full mb-3 p-2 bg-gray-700 rounded" placeholder="Barcode" value={productForm.barcode} onChange={e => setProductForm({...productForm, barcode: e.target.value})} />
+                <div className="flex gap-3"><button onClick={saveProduct} className="bg-blue-600 px-4 py-2 rounded flex-1">Save</button><button onClick={() => setShowProductModal(false)} className="bg-gray-600 px-4 py-2 rounded flex-1">Cancel</button></div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    };
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
